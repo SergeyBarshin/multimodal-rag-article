@@ -23,8 +23,7 @@ env/
 .env.*
 
 # Generated data/artifacts
-data/images/
-data/*.json
+
 indices/*.bin
 indices/*_ids.json
 bm25_metrics*.json
