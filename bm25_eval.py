@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import re
 from collections import defaultdict
@@ -86,7 +87,12 @@ def metrics_for_query(pred_ids: List[str], gold_ids: Set[str], k: int) -> Dict[s
     idcg = sum(1.0 / np.log2(rank + 1) for rank in range(1, ideal_hits + 1))
     ndcg_at_k = (dcg / idcg) if idcg > 0 else 0.0
 
-    return {"recall": recall_at_k, "mrr": mrr_at_k, "ndcg": ndcg_at_k}
+    return {
+        "recall": recall_at_k,
+        "mrr": mrr_at_k,
+        "ndcg": ndcg_at_k,
+        "first_hit_rank": float(hit_positions[0]) if hit_positions else 0.0,
+    }
 
 
 def evaluate(
@@ -95,23 +101,86 @@ def evaluate(
     benchmark: List[dict],
     query_field: str,
     ks: List[int],
-) -> Dict[str, dict]:
+) -> Tuple[Dict[str, dict], List[dict]]:
     groups = defaultdict(list)
+    per_query_rows = []
     skipped = 0
+    max_k = max(ks)
 
-    for item in benchmark:
+    for q_idx, item in enumerate(benchmark):
         query = item.get(query_field, "")
         gold_text_ids = set(item.get("_gold_text_ids", []))
+        item_type = item.get("type", "unknown")
+        query_tokens = tokenize(query)
+
         if not gold_text_ids:
             skipped += 1
+            row = {
+                "query_idx": q_idx,
+                "type": item_type,
+                "query_field": query_field,
+                "query": query,
+                "query_tokens": len(query_tokens),
+                "gold_text_count": 0,
+                "gold_text_ids": "",
+                f"pred_top{max_k}": "",
+                "top1_score": "",
+                "top1_minus_top5_score": "",
+                "error_bucket": "no_text_gold",
+            }
+            for k in ks:
+                row[f"recall@{k}"] = ""
+                row[f"mrr@{k}"] = ""
+                row[f"ndcg@{k}"] = ""
+            per_query_rows.append(row)
             continue
 
         scores = np.asarray(bm25.get_scores(tokenize(query)))
-        predicted = top_k_ids(scores, doc_ids, max(ks))
-        item_type = item.get("type", "unknown")
+        ranked_idx = np.argsort(scores)[::-1]
+        top_idx = ranked_idx[:max_k]
+        predicted = [doc_ids[i] for i in top_idx]
+        predicted_scores = [float(scores[i]) for i in top_idx]
 
         groups["overall"].append((predicted, gold_text_ids))
         groups[item_type].append((predicted, gold_text_ids))
+
+        top1_score = predicted_scores[0] if predicted_scores else 0.0
+        top5_score = predicted_scores[min(4, len(predicted_scores) - 1)] if predicted_scores else 0.0
+        score_gap = top1_score - top5_score if predicted_scores else 0.0
+
+        row = {
+            "query_idx": q_idx,
+            "type": item_type,
+            "query_field": query_field,
+            "query": query,
+            "query_tokens": len(query_tokens),
+            "gold_text_count": len(gold_text_ids),
+            "gold_text_ids": "|".join(sorted(gold_text_ids)),
+            f"pred_top{max_k}": "|".join(predicted),
+            "top1_score": round(top1_score, 6),
+            "top1_minus_top5_score": round(score_gap, 6),
+            "error_bucket": "",
+        }
+
+        missed_at_main_k = metrics_for_query(predicted, gold_text_ids, max_k)["recall"] == 0.0
+        if missed_at_main_k:
+            if len(query_tokens) <= 3:
+                row["error_bucket"] = "short_query"
+            elif top1_score <= 0:
+                row["error_bucket"] = "no_lexical_match"
+            elif len(gold_text_ids) > 1:
+                row["error_bucket"] = "multi_gold_miss"
+            else:
+                row["error_bucket"] = "lexical_mismatch"
+        else:
+            row["error_bucket"] = "hit"
+
+        for k in ks:
+            m = metrics_for_query(predicted, gold_text_ids, k)
+            row[f"recall@{k}"] = round(m["recall"], 6)
+            row[f"mrr@{k}"] = round(m["mrr"], 6)
+            row[f"ndcg@{k}"] = round(m["ndcg"], 6)
+        per_query_rows.append(row)
 
     result = {"query_field": query_field, "total_items": len(benchmark), "skipped_items": skipped, "metrics": {}}
 
@@ -131,7 +200,64 @@ def evaluate(
             result["metrics"][group_name][f"mrr@{k}"] = float(np.mean(mrr_vals)) if rows else 0.0
             result["metrics"][group_name][f"ndcg@{k}"] = float(np.mean(ndcg_vals)) if rows else 0.0
 
-    return result
+    return result, per_query_rows
+
+
+def write_metrics_csv(report: dict, ks: List[int], output_csv: Path):
+    rows = []
+    for group_name, vals in report["metrics"].items():
+        count = vals["count"]
+        for k in ks:
+            rows.append(
+                {
+                    "query_field": report["query_field"],
+                    "group": group_name,
+                    "k": k,
+                    "count": count,
+                    "recall": vals[f"recall@{k}"],
+                    "mrr": vals[f"mrr@{k}"],
+                    "ndcg": vals[f"ndcg@{k}"],
+                }
+            )
+
+    fieldnames = ["query_field", "group", "k", "count", "recall", "mrr", "ndcg"]
+    with output_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_csv(rows: List[dict], output_csv: Path):
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with output_csv.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def build_error_summary(per_query_rows: List[dict], ks: List[int]) -> List[dict]:
+    main_k = max(ks)
+    misses = []
+    for row in per_query_rows:
+        val = row.get(f"recall@{main_k}")
+        if val == "" or val == 1.0:
+            continue
+        misses.append(row)
+
+    by_bucket = defaultdict(int)
+    by_type = defaultdict(int)
+    for row in misses:
+        by_bucket[row["error_bucket"]] += 1
+        by_type[row["type"]] += 1
+
+    summary = []
+    for bucket, cnt in sorted(by_bucket.items(), key=lambda x: x[1], reverse=True):
+        summary.append({"slice": "error_bucket", "name": bucket, "miss_count": cnt})
+    for typ, cnt in sorted(by_type.items(), key=lambda x: x[1], reverse=True):
+        summary.append({"slice": "query_type", "name": typ, "miss_count": cnt})
+    return summary
 
 
 def print_report(report: dict, ks: List[int]):
@@ -163,6 +289,10 @@ def main():
     parser.add_argument("--query-field", default="question", choices=["question", "answer"], help="Which field to use as a query")
     parser.add_argument("--k", default="5,10", help="Comma-separated k values, e.g. 5,10")
     parser.add_argument("--output-json", default="bm25_metrics.json", help="Path to save metrics JSON")
+    parser.add_argument("--output-csv", default="bm25_metrics.csv", help="Path to save summary metrics CSV")
+    parser.add_argument("--per-query-csv", default="bm25_per_query.csv", help="Path to save per-query metrics CSV")
+    parser.add_argument("--errors-csv", default="bm25_errors.csv", help="Path to save missed queries CSV")
+    parser.add_argument("--error-summary-csv", default="bm25_error_summary.csv", help="Path to save grouped error summary CSV")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -185,7 +315,7 @@ def main():
     benchmark, patched_count = patch_gold_ids_with_context(benchmark, image_to_text, text_ids)
 
     bm25, doc_ids = build_bm25(theory)
-    report = evaluate(bm25, doc_ids, benchmark, query_field=args.query_field, ks=ks)
+    report, per_query_rows = evaluate(bm25, doc_ids, benchmark, query_field=args.query_field, ks=ks)
     report["patched_rows"] = patched_count
     report["docs_count"] = len(doc_ids)
 
@@ -194,7 +324,26 @@ def main():
 
     output_path = Path(args.output_json)
     output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Saved: {output_path.resolve()}")
+    print(f"Saved JSON: {output_path.resolve()}")
+
+    output_csv = Path(args.output_csv)
+    write_metrics_csv(report, ks, output_csv)
+    print(f"Saved CSV: {output_csv.resolve()}")
+
+    per_query_csv = Path(args.per_query_csv)
+    write_csv(per_query_rows, per_query_csv)
+    print(f"Saved per-query CSV: {per_query_csv.resolve()}")
+
+    main_k = max(ks)
+    misses = [r for r in per_query_rows if r.get(f"recall@{main_k}") == 0.0]
+    errors_csv = Path(args.errors_csv)
+    write_csv(misses, errors_csv)
+    print(f"Saved errors CSV: {errors_csv.resolve()}")
+
+    err_summary = build_error_summary(per_query_rows, ks)
+    err_summary_csv = Path(args.error_summary_csv)
+    write_csv(err_summary, err_summary_csv)
+    print(f"Saved error summary CSV: {err_summary_csv.resolve()}")
 
 
 if __name__ == "__main__":
