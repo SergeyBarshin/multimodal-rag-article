@@ -1,0 +1,16 @@
+experiment,method,item_type,miss_count
+Hybrid: BGE + SigLIP,hybrid,text,265
+Text Only (BGE),single,text,265
+Hybrid: BGE + CLIP,hybrid,text,260
+Vis: CLIP (Answer),single,hybrid,195
+Vis: SigLIP (Answer),single,hybrid,188
+Text Only (BGE),single,hybrid,141
+Hybrid: BGE + SigLIP,hybrid,hybrid,136
+Hybrid: BGE + CLIP,hybrid,hybrid,134
+Text Only (BGE),single,image,133
+Hybrid: BGE + CLIP,hybrid,image,133
+Hybrid: BGE + SigLIP,hybrid,image,133
+Vis: CLIP (Answer),single,image,133
+Vis: SigLIP (Answer),single,image,127
+Hybrid: BGE + Jina,runtime_error,,1
+Vis: Jina (Answer),runtime_error,,1
