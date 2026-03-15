@@ -1,0 +1,14 @@
+experiment,item_type,total,hits,miss_rate
+Hybrid: BGE + CLIP,image,133,0,1.0
+Hybrid: BGE + CLIP,hybrid,195,159,0.18461538461538463
+Hybrid: BGE + CLIP,text,369,304,0.17615176151761514
+Hybrid: BGE + SigLIP,image,133,0,1.0
+Hybrid: BGE + SigLIP,text,369,285,0.22764227642276424
+Hybrid: BGE + SigLIP,hybrid,195,151,0.22564102564102562
+Text Only (BGE),image,133,0,1.0
+Text Only (BGE),hybrid,195,148,0.24102564102564106
+Text Only (BGE),text,369,285,0.22764227642276424
+Vis: CLIP (Answer),hybrid,195,0,1.0
+Vis: CLIP (Answer),image,133,0,1.0
+Vis: SigLIP (Answer),hybrid,195,7,0.9641025641025641
+Vis: SigLIP (Answer),image,133,6,0.9548872180451128
